@@ -2,32 +2,27 @@ import os
 import os.path as osp
 
 import mmcv
-import numpy as np
 import torch
 import torch.distributed as dist
-from mmcv.runner import Hook, obj_from_dict
-from mmcv.parallel import scatter, collate
-from pycocotools.cocoeval import COCOeval
+from mmcv.parallel import collate, scatter
+from mmcv.runner import Hook
 from torch.utils.data import Dataset
-
-from .coco_utils import results2json, fast_eval_recall
-from .mean_ap import eval_map
-from mmdet import datasets
 
 
 class DistEvalHook(Hook):
 
-    def __init__(self, dataset, interval=1):
+    def __init__(self, dataset, interval=1, **eval_kwargs):
+        from mmdet import datasets
         if isinstance(dataset, Dataset):
             self.dataset = dataset
         elif isinstance(dataset, dict):
-            self.dataset = obj_from_dict(dataset, datasets,
-                                         {'test_mode': True})
+            self.dataset = datasets.build_dataset(dataset, {'test_mode': True})
         else:
             raise TypeError(
                 'dataset must be a Dataset object or a dict, not {}'.format(
                     type(dataset)))
         self.interval = interval
+        self.eval_kwargs = eval_kwargs
 
     def after_train_epoch(self, runner):
         if not self.every_n_epochs(runner, self.interval):
@@ -70,96 +65,9 @@ class DistEvalHook(Hook):
             dist.barrier()
         dist.barrier()
 
-    def evaluate(self):
-        raise NotImplementedError
-
-
-class DistEvalmAPHook(DistEvalHook):
-
     def evaluate(self, runner, results):
-        gt_bboxes = []
-        gt_labels = []
-        gt_ignore = [] if self.dataset.with_crowd else None
-        for i in range(len(self.dataset)):
-            ann = self.dataset.get_ann_info(i)
-            bboxes = ann['bboxes']
-            labels = ann['labels']
-            if gt_ignore is not None:
-                ignore = np.concatenate([
-                    np.zeros(bboxes.shape[0], dtype=np.bool),
-                    np.ones(ann['bboxes_ignore'].shape[0], dtype=np.bool)
-                ])
-                gt_ignore.append(ignore)
-                bboxes = np.vstack([bboxes, ann['bboxes_ignore']])
-                labels = np.concatenate([labels, ann['labels_ignore']])
-            gt_bboxes.append(bboxes)
-            gt_labels.append(labels)
-        # If the dataset is VOC2007, then use 11 points mAP evaluation.
-        if hasattr(self.dataset, 'year') and self.dataset.year == 2007:
-            ds_name = 'voc07'
-        else:
-            ds_name = self.dataset.CLASSES
-        mean_ap, eval_results = eval_map(
-            results,
-            gt_bboxes,
-            gt_labels,
-            gt_ignore=gt_ignore,
-            scale_ranges=None,
-            iou_thr=0.5,
-            dataset=ds_name,
-            print_summary=True)
-        runner.log_buffer.output['mAP'] = mean_ap
+        eval_res = self.dataset.evaluate(
+            results, logger=runner.logger, **self.eval_kwargs)
+        for name, val in eval_res.items():
+            runner.log_buffer.output[name] = val
         runner.log_buffer.ready = True
-
-
-class CocoDistEvalRecallHook(DistEvalHook):
-
-    def __init__(self,
-                 dataset,
-                 interval=1,
-                 proposal_nums=(100, 300, 1000),
-                 iou_thrs=np.arange(0.5, 0.96, 0.05)):
-        super(CocoDistEvalRecallHook, self).__init__(
-            dataset, interval=interval)
-        self.proposal_nums = np.array(proposal_nums, dtype=np.int32)
-        self.iou_thrs = np.array(iou_thrs, dtype=np.float32)
-
-    def evaluate(self, runner, results):
-        # the official coco evaluation is too slow, here we use our own
-        # implementation instead, which may get slightly different results
-        ar = fast_eval_recall(results, self.dataset.coco, self.proposal_nums,
-                              self.iou_thrs)
-        for i, num in enumerate(self.proposal_nums):
-            runner.log_buffer.output['AR@{}'.format(num)] = ar[i]
-        runner.log_buffer.ready = True
-
-
-class CocoDistEvalmAPHook(DistEvalHook):
-
-    def evaluate(self, runner, results):
-        tmp_file = osp.join(runner.work_dir, 'temp_0')
-        result_files = results2json(self.dataset, results, tmp_file)
-
-        res_types = ['bbox', 'segm'
-                     ] if runner.model.module.with_mask else ['bbox']
-        cocoGt = self.dataset.coco
-        imgIds = cocoGt.getImgIds()
-        for res_type in res_types:
-            cocoDt = cocoGt.loadRes(result_files[res_type])
-            iou_type = res_type
-            cocoEval = COCOeval(cocoGt, cocoDt, iou_type)
-            cocoEval.params.imgIds = imgIds
-            cocoEval.evaluate()
-            cocoEval.accumulate()
-            cocoEval.summarize()
-            metrics = ['mAP', 'mAP_50', 'mAP_75', 'mAP_s', 'mAP_m', 'mAP_l']
-            for i in range(len(metrics)):
-                key = '{}_{}'.format(res_type, metrics[i])
-                val = float('{:.3f}'.format(cocoEval.stats[i]))
-                runner.log_buffer.output[key] = val
-            runner.log_buffer.output['{}_mAP_copypaste'.format(res_type)] = (
-                '{ap[0]:.3f} {ap[1]:.3f} {ap[2]:.3f} {ap[3]:.3f} '
-                '{ap[4]:.3f} {ap[5]:.3f}').format(ap=cocoEval.stats[:6])
-        runner.log_buffer.ready = True
-        for res_type in res_types:
-            os.remove(result_files[res_type])
